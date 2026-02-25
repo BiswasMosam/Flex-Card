@@ -1,0 +1,36 @@
+# UTF-8
+# For more details about fixed file info 'ffi' see:
+# https://learn.microsoft.com/en-us/windows/win32/menurc/vs-versioninfo-resource
+
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '040904B0',
+        [
+          StringStruct('CompanyName', 'Mosam Biswas'),
+          StringStruct('FileDescription', 'Flex Card - System Hardware Information'),
+          StringStruct('FileVersion', '1.0.0.0'),
+          StringStruct('InternalName', 'Flex Card'),
+          StringStruct('LegalCopyright', 'Copyright (c) 2026 Mosam Biswas'),
+          StringStruct('OriginalFilename', 'Flex Card.exe'),
+          StringStruct('ProductName', 'Flex Card'),
+          StringStruct('ProductVersion', '1.0.0.0'),
+          StringStruct('Comments', 'Personal project by Mosam Biswas. https://www.mosambiswas.me'),
+          StringStruct('LegalTrademarks', 'Personal Project')
+        ]
+      )
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)

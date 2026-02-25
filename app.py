@@ -922,7 +922,7 @@ class HardwareInfoWindow(QMainWindow):
         self._apply_modern_theme()
         self._build_ui()
         self.refresh_data()
-
+        
     # ------------------------------
     # Modern dark UI theme
     # ------------------------------
