@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 from datetime import datetime
 
@@ -38,6 +39,29 @@ def format_bytes(value):
     return f"{size:.2f} PB"
 
 
+def format_marketed_storage(value_bytes):
+    if value_bytes is None:
+        return "N/A"
+    try:
+        size = float(value_bytes)
+    except Exception:
+        return "N/A"
+    if size <= 0:
+        return "N/A"
+
+    decimal_tb = size / (10**12)
+    decimal_gb = size / (10**9)
+
+    if decimal_tb >= 1:
+        rounded_tb = int(round(decimal_tb))
+        if abs(decimal_tb - rounded_tb) <= 0.15:
+            return f"{rounded_tb} TB"
+        return f"{decimal_tb:.1f} TB"
+
+    rounded_gb = int(round(decimal_gb))
+    return f"{rounded_gb} GB"
+
+
 def safe_text(value, fallback="N/A"):
     if value is None:
         return fallback
@@ -48,6 +72,139 @@ def safe_text(value, fallback="N/A"):
 def get_logo_path():
     logo_path = os.path.join(os.path.dirname(__file__), "img", "Logo.png")
     return logo_path if os.path.exists(logo_path) else None
+
+
+def get_section_icon_path(title, os_name=None):
+    icon_map = {
+        "CPU": "processor.svg",
+        "GPU": "graphics-card.png",
+        "RAM": "RAM.svg",
+        "Storage": "storage.svg",
+        "Motherboard": "motherboard.png",
+        "BIOS": "bios.png",
+    }
+
+    if title == "Operating System":
+        normalized_os = str(os_name or "").lower()
+        if "linux" in normalized_os:
+            file_name = "linux-platform.png"
+        elif "mac" in normalized_os or "darwin" in normalized_os or "os x" in normalized_os:
+            file_name = "apple-logo.png"
+        else:
+            file_name = "windows.png"
+    else:
+        file_name = icon_map.get(title)
+
+    if not file_name:
+        return None
+
+    icon_path = os.path.join(os.path.dirname(__file__), "img", file_name)
+    return icon_path if os.path.exists(icon_path) else None
+
+
+def _is_likely_integrated_gpu_name(gpu_name):
+    text = str(gpu_name or "").lower()
+    integrated_markers = [
+        "intel",
+        "uhd",
+        "iris",
+        "hd graphics",
+        "integrated",
+        "apu",
+        "radeon graphics",
+    ]
+    return any(marker in text for marker in integrated_markers)
+
+
+def _is_likely_discrete_gpu_name(gpu_name):
+    text = str(gpu_name or "").lower()
+    discrete_markers = [
+        "nvidia",
+        "geforce",
+        "rtx",
+        "gtx",
+        "quadro",
+        "tesla",
+        "titan",
+        "radeon rx",
+        "radeon pro",
+        "intel arc",
+        " arc ",
+    ]
+    return any(marker in text for marker in discrete_markers)
+
+
+def _gpu_priority_key(gpu):
+    name = safe_text(gpu.get("Name", ""), "")
+    memory_bytes = gpu.get("_memory_bytes", 0)
+    try:
+        memory_bytes = int(memory_bytes)
+    except Exception:
+        memory_bytes = 0
+    if memory_bytes < 0:
+        memory_bytes = 0
+
+    if _is_likely_discrete_gpu_name(name):
+        tier = 3
+    elif not _is_likely_integrated_gpu_name(name):
+        tier = 2
+    else:
+        tier = 1
+
+    return (tier, memory_bytes)
+
+
+def _pick_preferred_gpu(gpus):
+    if not gpus:
+        return {"Name": "N/A", "Memory": "N/A"}
+    return max(gpus, key=_gpu_priority_key)
+
+
+def _gpu_type_label(gpu_name):
+    if _is_likely_discrete_gpu_name(gpu_name):
+        return "External (Discrete)"
+    if _is_likely_integrated_gpu_name(gpu_name):
+        return "Integrated"
+    return "Unknown"
+
+
+def _query_nvidia_smi_gpus():
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=3,
+        )
+    except Exception:
+        return []
+
+    records = []
+    for raw_line in (result.stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 3:
+            continue
+        name, memory_mb_text, driver_version = parts[0], parts[1], parts[2]
+        try:
+            memory_mb = int(float(memory_mb_text))
+        except Exception:
+            memory_mb = 0
+        records.append(
+            {
+                "name": name,
+                "memory_mb": memory_mb,
+                "driver_version": driver_version,
+            }
+        )
+    return records
 
 
 # ------------------------------
@@ -88,7 +245,9 @@ def get_cpu_info(wmi_client):
 
 
 def get_gpu_info(wmi_client):
-    gpu_list = []
+    gpu_candidates = []
+    nvidia_smi_gpus = _query_nvidia_smi_gpus()
+
     try:
         gpus = wmi_client.Win32_VideoController()
         for gpu in gpus:
@@ -99,17 +258,56 @@ def get_gpu_info(wmi_client):
             except Exception:
                 memory_value = None
 
-            gpu_list.append(
+            normalized_memory = memory_value if (memory_value and memory_value > 0) else 0
+
+            name = safe_text(getattr(gpu, "Name", None))
+            driver_version = safe_text(getattr(gpu, "DriverVersion", None))
+
+            if normalized_memory == 0 and _is_likely_discrete_gpu_name(name):
+                for nvidia_gpu in nvidia_smi_gpus:
+                    nvidia_name = nvidia_gpu.get("name", "")
+                    if not nvidia_name:
+                        continue
+                    left = name.lower()
+                    right = nvidia_name.lower()
+                    if left in right or right in left:
+                        memory_mb = nvidia_gpu.get("memory_mb", 0)
+                        if memory_mb > 0:
+                            normalized_memory = memory_mb * 1024 * 1024
+                        smi_driver = safe_text(nvidia_gpu.get("driver_version", None))
+                        if smi_driver != "N/A":
+                            driver_version = smi_driver
+                        break
+
+            gpu_candidates.append(
                 {
-                    "Name": safe_text(getattr(gpu, "Name", None)),
-                    "Memory": format_bytes(memory_value) if memory_value else "N/A",
+                    "Name": name,
+                    "Memory": format_bytes(normalized_memory) if normalized_memory else "N/A",
+                    "_memory_bytes": normalized_memory,
+                    "Driver": driver_version,
+                    "Type": _gpu_type_label(name),
                 }
             )
     except Exception:
         pass
 
-    if not gpu_list:
-        gpu_list.append({"Name": "N/A", "Memory": "N/A"})
+    if not gpu_candidates:
+        return [{"Name": "N/A", "Memory": "N/A"}]
+
+    primary_gpu = _pick_preferred_gpu(gpu_candidates)
+
+    ordered = [primary_gpu] + [gpu for gpu in gpu_candidates if gpu is not primary_gpu]
+
+    gpu_list = []
+    for gpu in ordered:
+        gpu_list.append(
+            {
+                "Name": gpu["Name"],
+                "Memory": gpu["Memory"],
+                "Driver": gpu.get("Driver", "N/A"),
+                "Type": gpu.get("Type", "Unknown"),
+            }
+        )
 
     return gpu_list
 
@@ -117,23 +315,56 @@ def get_gpu_info(wmi_client):
 def get_ram_info(wmi_client):
     ram_data = {
         "Total": "N/A",
-        "Available": "N/A",
+        "Installed": "N/A",
+        "Usable": "N/A",
         "Used": "N/A",
-        "Usage": "N/A",
+        "Modules": "N/A",
+        "Module Layout": "N/A",
         "Speed": "N/A",
     }
 
     try:
         vm = psutil.virtual_memory()
         ram_data["Total"] = format_bytes(vm.total)
-        ram_data["Available"] = format_bytes(vm.available)
+        ram_data["Usable"] = format_bytes(vm.total)
         ram_data["Used"] = format_bytes(vm.used)
-        ram_data["Usage"] = f"{vm.percent}%"
     except Exception:
         pass
 
     try:
         modules = wmi_client.Win32_PhysicalMemory()
+
+        capacities = []
+        for module in modules:
+            try:
+                capacity_value = int(getattr(module, "Capacity", 0) or 0)
+            except Exception:
+                capacity_value = 0
+            if capacity_value > 0:
+                capacities.append(capacity_value)
+
+        if capacities:
+            total_installed_bytes = sum(capacities)
+            installed_gb = max(1, int(round(total_installed_bytes / (1024 ** 3))))
+            ram_data["Installed"] = f"{installed_gb} GB"
+            ram_data["Total"] = f"{installed_gb} GB"
+            ram_data["Modules"] = str(len(capacities))
+
+            module_size_gb = []
+            for capacity in capacities:
+                size_gb = max(1, int(round(capacity / (1024 ** 3))))
+                module_size_gb.append(size_gb)
+
+            layout_counts = {}
+            for size in module_size_gb:
+                layout_counts[size] = layout_counts.get(size, 0) + 1
+
+            layout_parts = []
+            for size in sorted(layout_counts):
+                count = layout_counts[size]
+                layout_parts.append(f"{count} x {size} GB")
+            ram_data["Module Layout"] = " + ".join(layout_parts)
+
         speeds = [int(m.Speed) for m in modules if getattr(m, "Speed", None)]
         if speeds:
             unique_speeds = sorted(set(speeds))
@@ -147,41 +378,67 @@ def get_ram_info(wmi_client):
     return ram_data
 
 
-def get_storage_info():
-    drives = []
+def get_storage_info(wmi_client):
+    logical_total = 0
+    logical_free = 0
+    file_systems = []
+    physical_total = 0
+
     try:
-        partitions = psutil.disk_partitions(all=False)
-        for partition in partitions:
-            if not partition.device:
-                continue
+        logical_disks = wmi_client.Win32_LogicalDisk(DriveType=3)
+        for disk in logical_disks:
             try:
-                usage = psutil.disk_usage(partition.mountpoint)
-                drives.append(
-                    {
-                        "Drive": partition.device,
-                        "Mount": partition.mountpoint,
-                        "File System": partition.fstype or "N/A",
-                        "Total": format_bytes(usage.total),
-                        "Free": format_bytes(usage.free),
-                    }
-                )
-            except (PermissionError, OSError):
+                size_value = int(getattr(disk, "Size", 0) or 0)
+                free_value = int(getattr(disk, "FreeSpace", 0) or 0)
+            except Exception:
                 continue
+
+            if size_value <= 0:
+                continue
+
+            logical_total += size_value
+            logical_free += max(0, min(free_value, size_value))
+
+            fs = safe_text(getattr(disk, "FileSystem", None), "")
+            if fs:
+                file_systems.append(fs)
     except Exception:
         pass
 
-    if not drives:
-        drives.append(
-            {
-                "Drive": "N/A",
-                "Mount": "N/A",
-                "File System": "N/A",
-                "Total": "N/A",
-                "Free": "N/A",
-            }
-        )
+    try:
+        physical_disks = wmi_client.Win32_DiskDrive()
+        for disk in physical_disks:
+            try:
+                disk_size = int(getattr(disk, "Size", 0) or 0)
+            except Exception:
+                disk_size = 0
+            if disk_size > 0:
+                physical_total += disk_size
+    except Exception:
+        pass
 
-    return drives
+    usable_total = logical_total if logical_total > 0 else None
+    installed_total = physical_total if physical_total > 0 else usable_total
+    used_total = None
+    if usable_total is not None:
+        used_total = max(0, usable_total - logical_free)
+
+    fs_summary = "N/A"
+    if file_systems:
+        fs_summary = ", ".join(sorted(set(file_systems)))
+
+    summary = {
+        "Drive": "Local Storage",
+        "Mount": "All local volumes",
+        "File System": fs_summary,
+        "Installed": format_marketed_storage(installed_total),
+        "Usable": format_bytes(usable_total) if usable_total is not None else "N/A",
+        "Used": format_bytes(used_total) if used_total is not None else "N/A",
+        "Total": format_bytes(usable_total) if usable_total is not None else "N/A",
+        "Free": format_bytes(logical_free) if usable_total is not None else "N/A",
+    }
+
+    return [summary]
 
 
 def get_motherboard_info(wmi_client):
@@ -249,7 +506,7 @@ def collect_system_specs():
         "CPU": get_cpu_info(wmi_client),
         "GPU": get_gpu_info(wmi_client),
         "RAM": get_ram_info(wmi_client),
-        "Storage": get_storage_info(),
+        "Storage": get_storage_info(wmi_client),
         "Motherboard": get_motherboard_info(wmi_client),
         "BIOS": get_bios_info(wmi_client),
         "OS": get_os_info(wmi_client),
@@ -335,17 +592,8 @@ def _wrap_multiline(text, metrics, max_width):
     return wrapped_lines or [""]
 
 
-def _get_export_icon_path(title):
-    icon_map = {
-        "CPU": "processor.svg",
-        "RAM": "RAM.svg",
-        "Storage": "storage.svg",
-    }
-    file_name = icon_map.get(title)
-    if not file_name:
-        return None
-    icon_path = os.path.join(os.path.dirname(__file__), "img", file_name)
-    return icon_path if os.path.exists(icon_path) else None
+def _get_export_icon_path(title, os_name=None):
+    return get_section_icon_path(title, os_name=os_name)
 
 
 def _build_export_sections(specs):
@@ -368,7 +616,7 @@ def _build_export_sections(specs):
         )
 
     cpu_cores = cpu.get("Physical Cores", "N/A")
-    first_gpu = gpus[0] if gpus else {"Name": "N/A", "Memory": "N/A"}
+    first_gpu = _pick_preferred_gpu(gpus)
 
     return [
         {
@@ -385,27 +633,28 @@ def _build_export_sections(specs):
             "subtitle": first_gpu.get("Name", "N/A"),
             "bullets": [
                 f"Memory: {first_gpu.get('Memory', 'N/A')}",
-                f"GPU Count: {len(gpus)}",
+                f"Type: {first_gpu.get('Type', 'Unknown')}",
+                f"Driver: {first_gpu.get('Driver', 'N/A')}",
             ],
             "icon": _get_export_icon_path("GPU"),
         },
         {
             "title": "RAM",
-            "subtitle": f"Total: {ram.get('Total', 'N/A')}",
+            "subtitle": f"Installed: {ram.get('Installed', ram.get('Total', 'N/A'))}",
             "bullets": [
-                f"Available: {ram.get('Available', 'N/A')}",
+                f"Usable: {ram.get('Usable', 'N/A')}",
+                f"Modules: {ram.get('Module Layout', ram.get('Modules', 'N/A'))}",
                 f"Speed: {ram.get('Speed', 'N/A')}",
-                f"Usage: {ram.get('Usage', 'N/A')}",
             ],
             "icon": _get_export_icon_path("RAM"),
         },
         {
             "title": "Storage",
-            "subtitle": f"{len(storage)} drive(s) detected",
+            "subtitle": f"Installed: {storage[0].get('Installed', 'N/A') if storage else 'N/A'}",
             "bullets": [
-                f"Primary: {storage[0].get('Drive', 'N/A') if storage else 'N/A'}",
-                f"Total: {storage[0].get('Total', 'N/A') if storage else 'N/A'}",
-                f"Free: {storage[0].get('Free', 'N/A') if storage else 'N/A'}",
+                f"Usable: {storage[0].get('Usable', storage[0].get('Total', 'N/A')) if storage else 'N/A'}",
+                f"Used: {storage[0].get('Used', 'N/A') if storage else 'N/A'}",
+                f"File System: {storage[0].get('File System', 'N/A') if storage else 'N/A'}",
             ],
             "icon": _get_export_icon_path("Storage"),
         },
@@ -429,7 +678,7 @@ def _build_export_sections(specs):
                 f"Build: {os_info.get('Build', 'N/A')}",
                 f"Architecture: {os_info.get('Architecture', 'N/A')}",
             ],
-            "icon": _get_export_icon_path("Operating System"),
+            "icon": _get_export_icon_path("Operating System", os_info.get("Name", "")),
         },
     ]
 
@@ -480,17 +729,29 @@ def _compute_export_card_layout(section, dimensions, metrics):
     }
 
 
-def _draw_svg_icon(painter, icon_path, x, y, size):
-    renderer = QSvgRenderer(icon_path)
-    if renderer.isValid():
-        renderer.render(painter, QRectF(float(x), float(y), float(size), float(size)))
+def _draw_icon(painter, icon_path, x, y, size):
+    if not icon_path:
+        return
+
+    extension = os.path.splitext(icon_path)[1].lower()
+    if extension == ".svg":
+        renderer = QSvgRenderer(icon_path)
+        if renderer.isValid():
+            renderer.render(painter, QRectF(float(x), float(y), float(size), float(size)))
+        return
+
+    pixmap = QPixmap(icon_path)
+    if pixmap.isNull():
+        return
+    scaled = pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    painter.drawPixmap(x, y, scaled)
 
 
 def export_specs_to_png(specs, output_path):
     sections = _build_export_sections(specs)
 
-    canvas_width = 1600
-    canvas_height = 2000
+    canvas_width = 1080
+    canvas_height = 1350
 
     scale = 1.0
     while True:
@@ -503,7 +764,7 @@ def export_specs_to_png(specs, output_path):
         card_width = (canvas_width - (outer_padding * 2) - column_gap) // 2
 
         scan_font = QFont("Ubuntu", max(11, int(14 * scale)))
-        title_font = QFont("Ubuntu", max(26, int(44 * scale)), QFont.Bold)
+        title_font = QFont("Ubuntu", max(18, int(30 * scale)), QFont.Bold)
         subtitle_font = QFont("Ubuntu", max(11, int(16 * scale)))
         bullet_font = QFont("Ubuntu", max(10, int(14 * scale)))
 
@@ -605,7 +866,7 @@ def export_specs_to_png(specs, output_path):
 
             if icon_path:
                 icon_y = card_y + card_padding
-                _draw_svg_icon(painter, icon_path, x + card_padding, icon_y, icon_size)
+                _draw_icon(painter, icon_path, x + card_padding, icon_y, icon_size)
 
             painter.setPen(QPen(QColor("#ffffff")))
             painter.setFont(title_font)
@@ -792,28 +1053,28 @@ class HardwareInfoWindow(QMainWindow):
     # Section icon helpers
     # ------------------------------
     def _get_section_icon_path(self, title):
-        icon_map = {
-            "CPU": "processor.svg",
-            "RAM": "RAM.svg",
-            "Storage": "storage.svg",
-        }
-        file_name = icon_map.get(title)
-        if not file_name:
-            return None
+        os_name = ""
+        if title == "Operating System" and self.current_specs:
+            os_name = self.current_specs.get("OS", {}).get("Name", "")
+        return get_section_icon_path(title, os_name=os_name)
 
-        icon_path = os.path.join(os.path.dirname(__file__), "img", file_name)
-        return icon_path if os.path.exists(icon_path) else None
-
-    def _build_svg_icon_label(self, icon_path, size=72):
-        renderer = QSvgRenderer(icon_path)
-        if not renderer.isValid():
-            return None
-
+    def _build_icon_label(self, icon_path, size=72):
+        extension = os.path.splitext(icon_path)[1].lower()
         pixmap = QPixmap(size, size)
         pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        renderer.render(painter)
-        painter.end()
+
+        if extension == ".svg":
+            renderer = QSvgRenderer(icon_path)
+            if not renderer.isValid():
+                return None
+            painter = QPainter(pixmap)
+            renderer.render(painter)
+            painter.end()
+        else:
+            source = QPixmap(icon_path)
+            if source.isNull():
+                return None
+            pixmap = source.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
         icon_label = QLabel()
         icon_label.setPixmap(pixmap)
@@ -832,7 +1093,7 @@ class HardwareInfoWindow(QMainWindow):
         icon_path = self._get_section_icon_path(title)
         icon_label = None
         if icon_path:
-            icon_label = self._build_svg_icon_label(icon_path)
+            icon_label = self._build_icon_label(icon_path)
         if icon_label:
             header_layout.addWidget(icon_label)
 
@@ -921,31 +1182,31 @@ class HardwareInfoWindow(QMainWindow):
         self._set_card_content("CPU", subtitle, lines)
 
     def _update_gpu_card(self, gpus):
-        first_gpu = gpus[0] if gpus else {"Name": "N/A", "Memory": "N/A"}
+        first_gpu = _pick_preferred_gpu(gpus)
         subtitle = first_gpu.get("Name", "N/A")
         lines = [
             f"Memory: {first_gpu.get('Memory', 'N/A')}",
-            f"GPU Count: {len(gpus)}",
+            f"Type: {first_gpu.get('Type', 'Unknown')}",
+            f"Driver: {first_gpu.get('Driver', 'N/A')}",
         ]
         self._set_card_content("GPU", subtitle, lines)
 
     def _update_ram_card(self, ram):
-        subtitle = f"Total: {ram.get('Total', 'N/A')}"
+        subtitle = f"Installed: {ram.get('Installed', ram.get('Total', 'N/A'))}"
         lines = [
-            f"Available: {ram.get('Available', 'N/A')}",
+            f"Usable: {ram.get('Usable', 'N/A')}",
+            f"Modules: {ram.get('Module Layout', ram.get('Modules', 'N/A'))}",
             f"Speed: {ram.get('Speed', 'N/A')}",
-            f"Usage: {ram.get('Usage', 'N/A')}",
         ]
         self._set_card_content("RAM", subtitle, lines)
 
     def _update_storage_card(self, drives):
-        drive_count = len(drives)
-        first_drive = drives[0] if drives else {"Drive": "N/A", "Total": "N/A", "Free": "N/A"}
-        subtitle = f"{drive_count} drive(s) detected"
+        first_drive = drives[0] if drives else {"Installed": "N/A", "Usable": "N/A", "Used": "N/A", "File System": "N/A"}
+        subtitle = f"Installed: {first_drive.get('Installed', 'N/A')}"
         lines = [
-            f"Primary: {first_drive.get('Drive', 'N/A')}",
-            f"Total: {first_drive.get('Total', 'N/A')}",
-            f"Free: {first_drive.get('Free', 'N/A')}",
+            f"Usable: {first_drive.get('Usable', first_drive.get('Total', 'N/A'))}",
+            f"Used: {first_drive.get('Used', 'N/A')}",
+            f"File System: {first_drive.get('File System', 'N/A')}",
         ]
         self._set_card_content("Storage", subtitle, lines)
 
